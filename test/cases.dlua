@@ -1,0 +1,170 @@
+-- Cases for token_bucket. M is defined by test/run.sh, which wraps the
+-- module in an IIFE and concatenates this file after it.
+--
+-- The clock is a variable these cases MOVE. Nothing here sleeps; that is
+-- the whole reason the module takes deps.now instead of calling the host.
+
+local fails = 0
+local function ok(c, m) if c then print("   ok   " .. m) else print("   FAIL " .. m); fails = fails + 1 end end
+
+-- A hand-driven clock in whole unix SECONDS, counting its own calls so the
+-- cases can assert when the module consults it.
+local function clock(t0)
+  local c = { t = t0 or 0, calls = 0 }
+  c.now = function() c.calls = c.calls + 1; return c.t end
+  return c
+end
+
+-- ------------------------------------------------------- construction
+
+local c = clock()
+
+local made, err = pcall(M.new)
+ok(not made and type(err) == 'string' and err:find('deps.now', 1, true) ~= nil,
+   'new() with no deps fails by name, mentioning deps.now')
+
+made, err = pcall(M.new, { now = 1234567890 })
+ok(not made and err:find('deps.now', 1, true) ~= nil,
+   'new{now = <a number>} fails by name rather than deferring a nil call')
+
+made, err = pcall(M.new, { now = c.now, max_keys = 0 })
+ok(not made and err:find('deps.max_keys', 1, true) ~= nil,
+   'new{max_keys = 0} fails by name, mentioning deps.max_keys')
+
+made, err = pcall(M.new, { now = c.now, max_keys = 'plenty' })
+ok(not made and err:find('deps.max_keys', 1, true) ~= nil,
+   'new{max_keys = <a string>} fails by name')
+
+ok(err:find('SECONDS', 1, true) == nil, 'the max_keys sentence is about max_keys, not about the clock')
+
+local b = M.new{ now = c.now }
+ok(b.max_keys == M.DEFAULT_MAX_KEYS and b.max_keys == 100000,
+   'max_keys defaults to the 100000 memory backstop and is a readable field')
+ok(M.new{ now = c.now, max_keys = 3 }.max_keys == 3, 'max_keys is overridable per instance')
+ok(c.calls == 0, 'new() never reads the clock; only allow() does')
+ok(b:count() == 0 and b:shed_count() == 0, 'a fresh instance answers 0 and 0, never nil')
+
+-- ------------------------------------------------------- the arithmetic
+
+-- burst is the bucket: a key seen for the first time gets the whole burst
+-- at once, which is the scheduled task waking from sleep with a queue.
+local fresh = M.new{ now = clock().now }
+local granted = 0
+for _ = 1, 10 do if fresh:allow('waker', 900, 10) then granted = granted + 1 end end
+ok(granted == 10, 'a key seen for the first time may spend its whole burst immediately')
+local allowed, wait = fresh:allow('waker', 900, 10)
+ok(allowed == false, 'the burst is finite: the eleventh call at a frozen clock is refused')
+ok(wait == 4, 'the refusal carries the computed wait -- 900/hour is a token every 4 seconds')
+
+-- success returns ONE value. A caller reading a second must get absence,
+-- not a zero it could pass to a retry-after header.
+local yes, nothing = fresh:allow('other', 3600, 1)
+ok(yes == true and nothing == nil, 'an allowed call returns true and NOTHING -- absence, not 0')
+
+-- refusal shape
+local d = clock()
+local bb = M.new{ now = d.now }
+ok(bb:allow('k', 3600, 3) and bb:allow('k', 3600, 3) and bb:allow('k', 3600, 3),
+   'burst 3 at a frozen clock spends exactly three tokens')
+allowed, wait = bb:allow('k', 3600, 3)
+ok(allowed == false, 'the fourth call is refused')
+ok(wait == 1, 'a drained 1/second bucket says come back in 1 second')
+ok(wait % 1 == 0 and wait >= 1, 'the wait is whole seconds and never below 1')
+
+-- the retry-after is honest: waiting exactly that long yields a token, and
+-- it is computed from the deficit rather than guessed.
+local e = clock()
+local half = M.new{ now = e.now }
+ok(half:allow('slow', 1800, 1) == true, '1800/hour, burst 1: the first call spends the token')
+e.t = 1
+allowed, wait = half:allow('slow', 1800, 1)
+ok(allowed == false and wait == 1,
+   'half a token after 1 second is still a refusal, and the deficit is 1 more second')
+e.t = e.t + wait
+ok(half:allow('slow', 1800, 1) == true, 'waiting exactly the advertised wait yields a token')
+
+-- refill is continuous but capped at burst: an hour of silence does not
+-- bank an hour of tokens.
+local f = clock()
+local cap = M.new{ now = f.now }
+for _ = 1, 5 do cap:allow('idle', 3600, 5) end
+f.t = 3600
+granted = 0
+for _ = 1, 20 do if cap:allow('idle', 3600, 5) then granted = granted + 1 end end
+ok(granted == 5, 'an hour of silence refills to burst and no further')
+
+-- the clock is SECONDS, and the rate is per_hour/3600 over it. 7200/hour is
+-- two tokens per tick of this clock; a millisecond clock would need 1000
+-- ticks for the same two tokens.
+local g = clock()
+local persec = M.new{ now = g.now }
+for _ = 1, 4 do persec:allow('rate', 7200, 4) end
+g.t = 1
+granted = 0
+for _ = 1, 5 do if persec:allow('rate', 7200, 4) then granted = granted + 1 end end
+ok(granted == 2, 'one second of the injected clock refills per_hour/3600 tokens, not per_hour/3600000')
+ok(g.calls > 0, 'allow() reads the clock on every call rather than caching it')
+
+-- keys do not share a bucket
+local h = clock()
+local keys = M.new{ now = h.now }
+keys:allow('a', 3600, 1)
+ok(keys:allow('a', 3600, 1) == false, 'key a is drained')
+ok(keys:allow('b', 3600, 1) == true, 'key b is untouched by key a')
+
+-- ------------------------------------------------ the counters and the shed
+
+local i = clock()
+local small = M.new{ now = i.now, max_keys = 3 }
+small:allow('k1', 3600, 1); small:allow('k2', 3600, 1); small:allow('k3', 3600, 1)
+ok(small:count() == 3, 'count() rises once per distinct key')
+small:allow('k1', 3600, 1)
+ok(small:count() == 3, 'a repeat call on a known key adds no key')
+ok(small:shed_count() == 0, 'nothing has been shed yet')
+
+-- at the cap, a NEW key drops the whole table rather than being refused.
+allowed = small:allow('k4', 3600, 1)
+ok(allowed == true, 'the call that trips the cap is allowed: the shed fails OPEN, it never refuses')
+ok(small:count() == 1, 'the table is dropped whole and reopened with just the new key')
+ok(small:shed_count() == 1, 'the shed is counted -- it is invisible from inside a request, so this integer is the only symptom')
+ok(small.max_keys == 3, 'a shed does not move the cap')
+
+-- what the shed costs: one fresh burst for everyone, including a caller
+-- who was being refused a moment ago.
+local j = clock()
+local tiny = M.new{ now = j.now, max_keys = 2 }
+tiny:allow('x', 3600, 1)
+ok(tiny:allow('x', 3600, 1) == false, 'x is drained and refused')
+tiny:allow('y', 3600, 1)
+tiny:allow('z', 3600, 1)
+ok(tiny:shed_count() == 1 and tiny:count() == 1, 'the third key sheds the table')
+ok(tiny:allow('x', 3600, 1) == true, 'after a shed x gets a fresh burst -- invisible from inside the request')
+
+-- the cap is only consulted when a key is CREATED, so traffic on known keys
+-- can sit at the cap forever without shedding.
+local k = clock()
+local atcap = M.new{ now = k.now, max_keys = 2 }
+atcap:allow('p', 3600, 1); atcap:allow('q', 3600, 1)
+for _ = 1, 20 do atcap:allow('p', 3600, 1); atcap:allow('q', 3600, 1) end
+ok(atcap:shed_count() == 0 and atcap:count() == 2,
+   'hammering known keys at the cap never sheds: the check lives inside the create branch')
+
+-- ------------------------------------------------------- two instances
+
+local shared = { now = clock().now, max_keys = 2 }
+local one, two = M.new(shared), M.new(shared)
+one:allow('s', 3600, 1)
+ok(one:allow('s', 3600, 1) == false, 'instance one has spent s')
+ok(two:allow('s', 3600, 1) == true, 'instance two, built from the same deps table, has its own s')
+one:allow('t1', 3600, 1); one:allow('t2', 3600, 1)
+ok(one:shed_count() == 1, 'instance one shed')
+ok(two:shed_count() == 0 and two:count() == 1, 'instance two neither shed nor lost its key')
+
+local ca, cb = clock(1000), clock(2000)
+local ia, ib = M.new{ now = ca.now }, M.new{ now = cb.now }
+ia:allow('w', 3600, 1); ib:allow('w', 3600, 1)
+ca.t = ca.t + 1
+ok(ia:allow('w', 3600, 1) == true, 'moving instance a\'s clock refills instance a')
+ok(ib:allow('w', 3600, 1) == false, 'instance b keeps its own clock and is still drained')
+
+print(fails == 0 and "PASS" or ("FAIL " .. fails))

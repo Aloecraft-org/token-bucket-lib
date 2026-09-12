@@ -1,0 +1,130 @@
+-- token_bucket -- one continuous-refill token bucket per key, over an
+-- injected clock.
+--
+-- Extracted from discofetch api/supervisor.lua (the "meter" section): the
+-- arithmetic, the branch order and the refusal behaviour are unchanged.
+-- What was module-level mutable state there is instance state here, so two
+-- buckets can coexist; nothing else moved.
+--
+-- ====================================================== the surface block
+--
+-- One token bucket per key, refilled continuously, spent one request at a
+-- time. per_hour is the sustained rate; burst is the bucket, and it is what
+-- a scheduled task waking from sleep and firing its queued updates actually
+-- needs. allow() returns true, or false plus whole seconds until a token
+-- exists -- the retry-after value, computed rather than guessed, and
+-- floored at 1 so nobody is ever told to retry in 0 seconds.
+--
+-- The buckets and the counters are MEMORY, deliberately, and they hold two
+-- invariants: root never hibernates, and nothing here touches the sql
+-- connector. A rate window that survives a deploy is not worth a database
+-- write per request, and a counter that resets on restart says so in its
+-- answer. That is the standing answer to the first proposal to persist
+-- these tables, and the reason this library has no db dep to give one.
+--
+-- 1. Entry points.
+--
+--      M.new{ now = <fn () -> unix SECONDS>, max_keys = <n> } -> instance
+--      instance:allow(key, per_hour, burst) -> true | false, seconds
+--      instance:count()      -> live keys, i.e. keys since the last shed
+--      instance:shed_count() -> how many times the table was dropped whole
+--      instance.max_keys     -> the cap count() is racing. A field rather
+--                               than a call because the stats card prints
+--                               the two together: a count published without
+--                               the cap it is racing is not worth printing.
+--
+--    ONE instance per deployment. The limiter and the stats handler are
+--    handed the same one; two instances split the counters and the stats
+--    card then under-reports both of them.
+--
+--    The clock's contract is load-bearing, not decorative: whole unix
+--    SECONDS. The refill and the ceil below are second-resolution by
+--    construction, so a millisecond clock changes every rate by 1000x.
+
+local M = {}
+
+-- Bodies are in the depth section; a Lua local must precede its use, so the
+-- names are declared here and the dispatch table binds them.
+local allow, count, shed_count
+
+-- 2. Configurable values.
+--
+-- A memory backstop, far above honest use. It is NOT a traffic dial: per_hour
+-- and burst are the dials. Tuning this down to shape traffic instead sheds
+-- every caller's window at once, which is not a refusal anyone can see.
+M.DEFAULT_MAX_KEYS = 100000
+
+-- 3. Fan-out: everything an instance answers to. new() binds exactly this
+-- table, so a fourth method is a line here rather than a function that
+-- appears somewhere below.
+local METHODS = {
+  allow      = function (self, key, per_hour, burst) return allow(self, key, per_hour, burst) end,
+  count      = function (self) return count(self) end,
+  shed_count = function (self) return shed_count(self) end,
+}
+
+-- depth: construction. Every dep is checked here, naming the dep in the
+-- sentence, so a wrong one is a failure at new() and not a nil call on the
+-- serving path an hour later.
+function M.new(deps)
+  deps = deps or {}
+  assert(type(deps.now) == 'function',
+    'token_bucket.new: deps.now must be a function returning unix SECONDS')
+  local max_keys = deps.max_keys or M.DEFAULT_MAX_KEYS
+  assert(type(max_keys) == 'number' and max_keys >= 1,
+    'token_bucket.new: deps.max_keys must be a number of keys >= 1')
+  return setmetatable({
+    now      = deps.now,
+    max_keys = max_keys,
+    -- buckets is REASSIGNED on a shed, never cleared in place. It has to
+    -- stay reachable through self for that reason: a closure that captured
+    -- the table would go on writing into the dropped one.
+    buckets  = {},
+    keys     = 0,
+    -- How often the table above has been dropped whole. A shed is INVISIBLE
+    -- from inside a request -- everyone simply gets a fresh burst -- and
+    -- from outside it looks like the rate limiter briefly not being there,
+    -- which is the one symptom nobody would think to attribute to a memory
+    -- cap. One integer, read back by GET /v1/admin/stats, is the difference
+    -- between that being a question with an answer and a question nobody
+    -- can ask. It is the closest thing to monitoring this program has.
+    sheds    = 0,
+  }, { __index = METHODS })
+end
+
+-- depth: the refill arithmetic. rate is tokens per second, so the elapsed
+-- term and the ceil below both depend on now() answering in seconds.
+function allow(self, key, per_hour, burst)
+  local t = self.now()
+  local b = self.buckets[key]
+  if not b then
+    if self.keys >= self.max_keys then
+      -- Shed the whole table rather than refuse new keys: the cost is one
+      -- fresh burst for everyone, the alternative is stale keys squatting
+      -- while new callers are turned away. It fails open on purpose; an
+      -- LRU here would be a refusal nobody asked for.
+      self.buckets = {}
+      self.keys = 0
+      self.sheds = self.sheds + 1
+    end
+    b = { tokens = burst, at = t }
+    self.buckets[key] = b
+    self.keys = self.keys + 1
+  end
+  local rate = per_hour / 3600
+  b.tokens = math.min(burst, b.tokens + (t - b.at) * rate)
+  b.at = t
+  if b.tokens >= 1 then
+    b.tokens = b.tokens - 1
+    return true
+  end
+  return false, math.max(1, math.ceil((1 - b.tokens) / rate))
+end
+
+-- depth: the two counters the stats card reads. Both are plain integers and
+-- never nil, because a card printing a blank is a card nobody trusts.
+function count(self) return self.keys end
+
+function shed_count(self) return self.sheds end
+
+return M
