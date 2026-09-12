@@ -83,6 +83,32 @@ ok(allowed == false and wait == 1,
 e.t = e.t + wait
 ok(half:allow('slow', 1800, 1) == true, 'waiting exactly the advertised wait yields a token')
 
+-- Every rate above divides evenly, so ceil and floor agree and neither the
+-- rounding nor the clock update below is actually being exercised. 1440/hour
+-- is 0.4 tokens a second, which does not, and it pins two things at once.
+--
+-- (a) the wait ROUNDS UP. A deficit of 1.5 seconds advertised as 1 would send
+--     the caller back to a bucket that is still empty -- a retry-after that is
+--     early is worse than none, because the caller believes it.
+-- (b) a REFUSAL advances b.at too. The bucket's clock moves on every call, not
+--     only on the ones that spend. Were it moved into the allowed branch the
+--     elapsed term would run from the last token spent, and a caller polling
+--     while refused would be refilled twice over -- fastest for whoever
+--     hammers hardest, which is exactly backwards.
+local m = clock()
+local poll = M.new{ now = m.now }
+for _ = 1, 5 do poll:allow('poller', 1440, 5) end
+m.t = 1
+allowed, wait = poll:allow('poller', 1440, 5)
+ok(allowed == false, '0.4 tokens a second: one second after draining is still a refusal')
+ok(wait == 2, 'a 1.5 second deficit is advertised as 2 -- ceil, never floor')
+m.t = 2
+ok(poll:allow('poller', 1440, 5) == false,
+   'at second 1, which a floor would have advertised, there is still no token: the wait is never early')
+m.t = 3
+ok(poll:allow('poller', 1440, 5) == true,
+   'at the advertised second there is a token, and only one refill happened per second spent refused')
+
 -- refill is continuous but capped at burst: an hour of silence does not
 -- bank an hour of tokens.
 local f = clock()
@@ -103,7 +129,7 @@ g.t = 1
 granted = 0
 for _ = 1, 5 do if persec:allow('rate', 7200, 4) then granted = granted + 1 end end
 ok(granted == 2, 'one second of the injected clock refills per_hour/3600 tokens, not per_hour/3600000')
-ok(g.calls > 0, 'allow() reads the clock on every call rather than caching it')
+ok(g.calls == 9, 'allow() reads the clock ONCE PER CALL -- 9 allows, 9 reads -- rather than caching it')
 
 -- keys do not share a bucket
 local h = clock()
